@@ -5,220 +5,92 @@
 #include <unistd.h> // getuid
 #include <pwd.h> //getpwuid
 #include <sys/stat.h> // mkdir
-#include <stdarg.h>
+#include <dirent.h>
+#include <errno.h>
 #include "db.h"
+#include "dbentry.h"
+#include "common.h"
+#include "strarr.h"
+
+#define open_file_in_db_path(filename, mode) 	open_file_in_path(\
+	g_database.db_path, (filename), (mode))
+#define open_file_in_cache_path(filename, mode) open_file_in_path(\
+	g_database.cache_path, (filename), (mode))
 
 static struct {
 	char config_path[PATH_MAX];
 	char db_path[PATH_MAX];
 	char cache_path[PATH_MAX];
-} init_data;
+	StrArr *filenames;
+} g_database;
 
-#define strempty(str) ((str)[0]==0)
-#define path_join(base_size, base, ...) __path_join(base_size, base, __VA_ARGS__, NULL)
-#define path_join_to(dest_size, dest, base, ...) __path_join((dest_size), strcpy((dest), (base)), __VA_ARGS__, NULL)
-#define open_file_in_db_path(filename, mode) open_file_in_path(init_data.db_path, (filename), (mode))
-#define open_file_in_cache_path(filename, mode) open_file_in_path(init_data.cache_path, (filename), (mode))
+static int db_write_entry_struct(DbEntry *entry);
+static int db_write_entry_content(DbEntry *entry);
+static int db_update_entry_file_struct(DbEntry * entry);
+static int db_cache_entry_content(DbEntry *entry);
+static int db_update(void);
 
-static void write_file_to_another(FILE *dest, FILE *src);
-static FILE *open_file_in_path(const char *path, const char *filename, const char *mode);
-static int db_entry_write_struct(DbEntry *entry);
-static int db_entry_write_content(DbEntry *entry);
-static int db_entry_update_file_struct(DbEntry * entry);
-static char *__path_join(size_t base_size, char *base, ...);
-
-static char error_string[128];
-
-static char *__path_join(size_t base_size, char *base, ...){
-	va_list args;
-	va_start(args, base);
-
-	char *p;
-	char *base_adv = base;
-	int avaliable = base_size - (strlen(base));
-
-	while((p = va_arg(args, char*)) != NULL){
-
-		size_t p_len = strlen(p);
-		size_t adv_len = strlen(base_adv);
-
-		avaliable -= p_len;
-
-		if(base_adv[adv_len - 1] == '/'){
-			if(avaliable <= 0)
-				break;
-
-			strcat(base_adv, p);
-			base_adv += p_len;
-		} else {
-			if(--avaliable <= 0)
-				break;
-
-			base_adv[adv_len] = '/';
-			base_adv[adv_len + 1] = 0;
-
-			strcat(base_adv, p);
-			base_adv += p_len + 1;
-		}
-		
-	}
-
-	va_end(args);
-	return base;
+void db_finish(void){
+	strarr_free(g_database.filenames);
 }
 
-void db_init(void){
+int db_init(const char *dbname){
 
 	struct passwd *pw = getpwuid(getuid());
 	char *home = pw->pw_dir;
 
-	char *config_path = path_join_to(PATH_MAX, init_data.config_path,
+	char *config_path = path_join_auto(g_database.config_path,
 		home, ".thingdb");
-	char *db_path = path_join_to(PATH_MAX, init_data.db_path,
-		config_path, "db");
-	char *cache_path = path_join_to(PATH_MAX, init_data.cache_path,
+	char *db_path = path_join_auto(g_database.db_path,
+		config_path, dbname);
+	char *cache_path = path_join_auto(g_database.cache_path,
 		home, ".cache", "thingdb");
 
-	puts(config_path);
-	puts(db_path);
-	puts(cache_path);
+	if(mkdir(config_path, S_IRWXU) != 0 && errno != EEXIST)
+		return CANNOT_CREATE_CONFIG_DIR;
+	if(mkdir(db_path, S_IRWXU) != 0 && errno != EEXIST)
+		return CANNOT_CREATE_DB_DIR;
+	if(mkdir(cache_path, S_IRWXU) != 0 && errno != EEXIST)
+		return CANNOT_CREATE_CACHE_DIR;
 
-	mkdir(config_path, S_IRWXU);
-	mkdir(db_path, S_IRWXU);
-	mkdir(cache_path, S_IRWXU);
+	g_database.filenames = strarr_new(MAX_DB_FILES, NAME_MAX);
+	db_update();
 
-}
-
-int db_entry_tag_count(DbEntry *entry){
-	return entry->_private.tag_count;
-}
-
-int db_entry_tag_list_is_full(DbEntry *entry){
-	return entry->_private.tag_count == TAG_LIST_LENGTH;
-}
-
-int db_entry_tag_list_is_empty(DbEntry *entry){
-	return entry->_private.tag_count == 0;
-}
-
-int db_entry_tag_list_has_index(DbEntry *entry, unsigned int index){
-	return entry->_private.tag_count > index;
-}
-
-void db_entry_clear_tags(DbEntry *entry){
-	entry->_private.tag_count = 0;
-}
-
-int db_entry_append_tag(DbEntry *entry, const char *tag){
-	if(strempty(tag))
-		return TAG_LIST_INVALID_TAG;
-	if(strlen(tag) + 1 > TAG_NAME_SIZE)
-		return TAG_LIST_INVALID_TAG;
-
-	int tag_count = entry->_private.tag_count;
-
-	if(db_entry_tag_list_is_full(entry))
-		return TAG_LIST_IS_FULL;
-	if(db_entry_fetch_tag(entry, tag) != FAIL)
-		return TAG_ALREADY_EXISTS;
-
-	strcpy(entry->_private.tags[tag_count], tag);
-	entry->_private.tag_count++;
+	strarr_print(g_database.filenames);
 
 	return SUCCESS;
 }
 
-int db_entry_remove_tag(DbEntry *entry, unsigned int index){
-	if(db_entry_tag_list_has_index(entry, index)){
-		unsigned int last_index = entry->_private.tag_count - 1;
+static int db_update(void){
+	DIR *d;
+	struct dirent *ent;
 
-		if(index != last_index)
-			strcpy(entry->_private.tags[index], entry->_private.tags[last_index]);
+	if((d = opendir(g_database.db_path)) == NULL)
+		return CANNOT_OPEN_DB_DIR;
 
-		entry->_private.tag_count--;
-		return SUCCESS;
+	while((ent = readdir(d)) != NULL){
+		if(strcmp(ent->d_name, "..") == 0 ||
+			strcmp(ent->d_name, ".") == 0)
+			continue;
+
+		strarr_append(g_database.filenames, ent->d_name);
 	}
 
-	return FAIL;
+	closedir(d);
+
+	return SUCCESS;
 }
 
-
-char *db_entry_get_tag(DbEntry *entry, unsigned int index){
-	if(db_entry_tag_list_has_index(entry, index))
-		return entry->_private.tags[index];
-
-	return NULL;
+int db_check_entry_written(DbEntry *entry){
+	return strarr_fetch(g_database.filenames, entry->db_filename) != FAIL;
 }
 
-int db_entry_fetch_tag(DbEntry *entry, const char *tag){
-	int tag_count = entry->_private.tag_count;
-	
-	if(tag_count == 0)
-		return FAIL;
-
-	for(int i = 0; i < tag_count; i++){
-		if(strcmp(entry->_private.tags[i], tag) == 0)
-			return i;
-	}
-	
-	// not found
-	return FAIL;
-}
-
-
-DbEntry *db_entry_new(void){
-
-	// a lista de tags fica vazia
-	DbEntry *new = calloc(1, sizeof(DbEntry));
-
-	return new;
-
-}
-
-void debug_db_entry_print_tags(DbEntry *entry){
-	int tag_count = db_entry_tag_count(entry);
-
-	puts("{");
-	for(int i = 0; i < tag_count; i++){
-		printf("  [%u]%s'\n", i, db_entry_get_tag(entry, i));
-	}
-	puts("}");
-}
-
-int db_entry_written(DbEntry *entry){
-	FILE *fp = open_file_in_db_path(entry->db_filename, "r");
-	if(fp == NULL)
-		return 0;
-	fclose(fp);
-	return 1;
-}
-
-static void write_file_to_another(FILE *dest, FILE *src){
-
-	char buffer[BUFSIZ];
-	size_t nbytes;
-
-	while((nbytes = fread(buffer, 1, sizeof(buffer), src)))
-		fwrite(buffer, nbytes, 1, dest);
-
-}
-
-static FILE *open_file_in_path(const char *path, const char *filename, const char *mode){
-	char filepath[PATH_MAX];
-	strcpy(filepath, path);
-	path_join(PATH_MAX, filepath, filename);
-
-	FILE *fp = fopen(filepath, mode);
-
-	return fp;
-}
-
-static int db_entry_write_struct(DbEntry *entry){
+static int db_write_entry_struct(DbEntry *entry){
 
 	FILE *fp = open_file_in_db_path(entry->db_filename, "w");
 	
 	if(fp == NULL)
-		return FAIL;
+		return CANNOT_OPEN_DB_FILE;
 
 	fwrite((char*)entry, sizeof(DbEntry), 1, fp);
 
@@ -227,7 +99,10 @@ static int db_entry_write_struct(DbEntry *entry){
 	return SUCCESS;
 }
 
-static int db_entry_write_content(DbEntry *entry){
+static int db_write_entry_content(DbEntry *entry){
+
+	if(path_is_dir(entry->content_filepath))
+		return CANNOT_OPEN_CONTENT_FILE;
 
 	FILE *db_file = open_file_in_db_path(entry->db_filename, "a");
 	if(db_file == NULL)
@@ -248,8 +123,8 @@ static int db_entry_write_content(DbEntry *entry){
 
 }
 
-static int db_entry_cache_content(DbEntry *entry){
-	if(!db_entry_written(entry))
+static int db_cache_entry_content(DbEntry *entry){
+	if(!db_check_entry_written(entry))
 		return NOT_WRITTEN;
 
 	FILE *db_file = open_file_in_db_path(entry->db_filename, "r");
@@ -272,13 +147,13 @@ static int db_entry_cache_content(DbEntry *entry){
 	return SUCCESS;
 }
 
-static int db_entry_update_file_struct(DbEntry *entry){
+static int db_update_entry_file_struct(DbEntry *entry){
 
 	int ret;
-	if((ret = db_entry_cache_content(entry)) != SUCCESS)
+	if((ret = db_cache_entry_content(entry)) != SUCCESS)
 		return ret;
 
-	if((ret = db_entry_write_struct(entry)) != SUCCESS)
+	if((ret = db_write_entry_struct(entry)) != SUCCESS)
 		return ret;
 
 	FILE *dbfp = open_file_in_db_path(entry->db_filename, "a");
@@ -299,79 +174,35 @@ static int db_entry_update_file_struct(DbEntry *entry){
 	return SUCCESS;
 }
 
-int db_entry_update(DbEntry *entry, int only_struct){
-
-	if(only_struct)
-		return db_entry_update_file_struct(entry);
-
+int db_update_entry(DbEntry *entry, int only_struct){
 	int ret;
 
-	if((ret = db_entry_write_struct(entry)) != SUCCESS)
-		return ret;
-	if((ret = db_entry_write_content(entry)) != SUCCESS)
-		return ret;
-
-	return SUCCESS;
-
-}
-
-int db_entry_read(char *filename, DbEntry **ret){
-	
-	FILE *fp = open_file_in_db_path(filename, "rb");
-
-	if(fp == NULL)
-		return CANNOT_OPEN_DB_FILE; 
-
-	*ret = db_entry_new();
-
-	fread(*ret, sizeof(DbEntry), 1, fp);
-
-	fclose(fp);
-	
-	return SUCCESS;
-}
-
-
-char *db_entry_get_error(int error){
-	
-	switch(error){
-		case FAIL:
-			strcpy(error_string, "Failed");
-			break;
-		case SUCCESS:
-			strcpy(error_string, "Success");
-			break;
-		case TAG_LIST_INVALID_TAG:
-			strcpy(error_string, "The given tag is invalid");
-			break;
-		case TAG_LIST_IS_FULL:
-			strcpy(error_string, "The tag list is full");
-			break;
-		case TAG_ALREADY_EXISTS:
-			strcpy(error_string, "The given tag already exists in the tag list");
-			break;
-		case CANNOT_OPEN_DB_FILE:
-			strcpy(error_string, "Cannot open the file of the given entry");
-			break;
-		case CANNOT_OPEN_CONTENT_FILE:
-			strcpy(error_string, "Cannot open the file of the given entry's content");
-			break;
-		case CANNOT_OPEN_CACHE_FILE:
-			strcpy(error_string, "Cannot open the cache file of the given entry");
-			break;
-		case MISSING_DB_FILENAME:
-			strcpy(error_string, "The given entry is missing `db_filename` field");
-			break;
-		case MISSING_CONTENT_FILEPATH:
-			strcpy(error_string, "The given entry is missing `content_filepath` field");
-			break;
-		case NOT_WRITTEN:
-			strcpy(error_string, "The given entry is not written to a file inside de database folder");
-			break;
-		default:
-			return NULL;
+	if(only_struct){
+		if((ret = db_update_entry_file_struct(entry)) != SUCCESS)
+			return ret;
+	} else {
+		if((ret = db_write_entry_struct(entry)) != SUCCESS)
+			return ret;
+		db_write_entry_content(entry);
 	}
+	
+	strarr_append(g_database.filenames, entry->db_filename);
+	return SUCCESS;
+}
 
-	return error_string;
+int db_get_entry_index(DbEntry *entry){
+	return strarr_fetch(g_database.filenames, entry->db_filename);
+}
 
+// TODO
+int db_delete_entry(unsigned i){
+	NOT_IMPL;
+}
+
+DbEntry *db_load_entry(unsigned i){
+	NOT_IMPL;
+}
+
+int db_n_entries(void){
+	return strarr_item_count(g_database.filenames);
 }
